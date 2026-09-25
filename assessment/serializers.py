@@ -7,15 +7,19 @@ from drf_spectacular.utils import extend_schema_field
 
 from assessment.models import (
     CleaningContract,
+    CollectionDevice,
     DuplicateCandidate,
     EscalationRecord,
     EvidencePhoto,
+    IngestedOperation,
+    OperationReceipt,
     PenaltyUnit,
     PenaltyVersion,
     ProblemEvent,
     Rectification,
     ReviewRecord,
     RoadGrid,
+    StagedMedia,
 )
 from assessment.services.duplicates import generate_candidates_for_photo
 from assessment.services.phash import compute_phash_hex
@@ -201,6 +205,163 @@ class EscalationRunSerializer(serializers.Serializer):
     now = serializers.DateTimeField(required=False, help_text="注入的当前时间；不传则用服务器时钟")
     default_sla_hours = serializers.IntegerField(required=False, min_value=1)
     actor = serializers.CharField(required=False, default="escalation-job", max_length=64)
+
+
+# ---------------------------------------------------------------- 采集包接入
+
+
+class StagedMediaUploadSerializer(serializers.Serializer):
+    """暂存媒体上传（multipart）。同一 (设备, media_key) 重传幂等。"""
+
+    device_no = serializers.CharField(max_length=64)
+    media_key = serializers.CharField(max_length=64)
+    image = serializers.ImageField()
+
+
+class StagedMediaReadSerializer(serializers.ModelSerializer):
+    device_no = serializers.CharField(source="device.device_no", read_only=True)
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+
+    class Meta:
+        model = StagedMedia
+        fields = [
+            "id", "device_no", "media_key", "image", "sha256",
+            "status", "status_display", "consumed_by", "created_at",
+        ]
+        read_only_fields = fields
+
+
+class PhotoReportPayloadSerializer(serializers.Serializer):
+    """问题照片立案参数：照片引用（媒体键）+ 立案资料 + 位置。"""
+
+    media_key = serializers.CharField(max_length=64, help_text="暂存媒体的客户端媒体键")
+    category = serializers.ChoiceField(
+        choices=ProblemEvent.Category.choices, required=False, default=ProblemEvent.Category.OTHER,
+    )
+    description = serializers.CharField(required=False, allow_blank=True, default="", max_length=512)
+    lng = serializers.FloatField(min_value=-180, max_value=180)
+    lat = serializers.FloatField(min_value=-90, max_value=90)
+    uploader = serializers.CharField(required=False, allow_blank=True, default="", max_length=64)
+    note = serializers.CharField(required=False, allow_blank=True, default="", max_length=256)
+
+
+class RectificationPayloadSerializer(serializers.Serializer):
+    """整改回执参数：event_no 或 report_op_id 二之一定位事件，可附整改后照片。"""
+
+    event_no = serializers.CharField(required=False, max_length=32)
+    report_op_id = serializers.CharField(required=False, max_length=64)
+    media_key = serializers.CharField(required=False, max_length=64)
+    lng = serializers.FloatField(required=False, min_value=-180, max_value=180)
+    lat = serializers.FloatField(required=False, min_value=-90, max_value=90)
+    note = serializers.CharField(required=False, allow_blank=True, default="", max_length=512)
+    actor = serializers.CharField(required=False, allow_blank=True, default="", max_length=64)
+
+    def validate(self, attrs):
+        if bool(attrs.get("event_no")) == bool(attrs.get("report_op_id")):
+            raise serializers.ValidationError("event_no 与 report_op_id 必须且只能提供一个")
+        if ("lng" in attrs) != ("lat" in attrs):
+            raise serializers.ValidationError("lng/lat 必须同时提供")
+        return attrs
+
+
+_PAYLOAD_SERIALIZERS = {
+    IngestedOperation.OpType.PHOTO_REPORT: PhotoReportPayloadSerializer,
+    IngestedOperation.OpType.RECTIFICATION: RectificationPayloadSerializer,
+}
+
+
+class IngestOperationSerializer(serializers.Serializer):
+    """单条设备操作：稳定操作号 + 设备内序号 + 业务发生时间 + 业务参数。"""
+
+    op_id = serializers.CharField(max_length=64)
+    seq = serializers.IntegerField(min_value=1)
+    type = serializers.ChoiceField(choices=IngestedOperation.OpType.choices)
+    occurred_at = serializers.DateTimeField(help_text="业务发生时间（归属/整改均以它为准）")
+    payload = serializers.JSONField()
+
+    def validate(self, attrs):
+        payload_serializer = _PAYLOAD_SERIALIZERS[attrs["type"]](data=attrs["payload"])
+        payload_serializer.is_valid(raise_exception=True)
+        attrs["payload"] = payload_serializer.validated_data
+        return attrs
+
+
+class IngestBatchSerializer(serializers.Serializer):
+    """采集包：同一设备的一批操作。逐条入账，逐条回执。"""
+
+    device_no = serializers.CharField(max_length=64)
+    batch_no = serializers.CharField(required=False, allow_blank=True, default="", max_length=64)
+    operations = IngestOperationSerializer(many=True)
+
+    def validate_operations(self, operations):
+        if not operations:
+            raise serializers.ValidationError("operations 不能为空")
+        for field in ("seq", "op_id"):
+            values = [op[field] for op in operations]
+            if len(values) != len(set(values)):
+                raise serializers.ValidationError(f"同一批次内 {field} 重复")
+        return operations
+
+
+class IngestReceiptItemSerializer(serializers.Serializer):
+    """批量接入响应中的逐条回执（status=conflict 表示与账本冲突、未入账）。"""
+
+    receipt_id = serializers.IntegerField(allow_null=True)
+    op_id = serializers.CharField()
+    seq = serializers.IntegerField()
+    status = serializers.ChoiceField(
+        choices=[*OperationReceipt.Status.values, "conflict"],
+    )
+    replayed = serializers.BooleanField()
+    result = serializers.JSONField(allow_null=True)
+    error = serializers.JSONField(allow_null=True)
+
+
+class IngestBatchResponseSerializer(serializers.Serializer):
+    device_no = serializers.CharField()
+    received_watermark = serializers.IntegerField()
+    applied_watermark = serializers.IntegerField()
+    receipts = IngestReceiptItemSerializer(many=True)
+
+
+class CollectionDeviceSerializer(serializers.ModelSerializer):
+    applied_count = serializers.IntegerField(read_only=True)
+    pending_count = serializers.IntegerField(read_only=True)
+    ignored_count = serializers.IntegerField(read_only=True)
+    failed_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = CollectionDevice
+        fields = [
+            "id", "device_no", "name",
+            "received_watermark", "applied_watermark", "last_seen_at",
+            "applied_count", "pending_count", "ignored_count", "failed_count",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+class OperationReceiptSerializer(serializers.ModelSerializer):
+    """逐条回执（含账本原文，支撑全链路追溯）。"""
+
+    device_no = serializers.CharField(source="operation.device.device_no", read_only=True)
+    op_id = serializers.CharField(source="operation.op_id", read_only=True)
+    seq = serializers.IntegerField(source="operation.seq", read_only=True)
+    op_type = serializers.CharField(source="operation.op_type", read_only=True)
+    occurred_at = serializers.DateTimeField(source="operation.occurred_at", read_only=True)
+    payload = serializers.JSONField(source="operation.payload", read_only=True)
+    batch_no = serializers.CharField(source="operation.batch_no", read_only=True)
+    received_at = serializers.DateTimeField(source="operation.received_at", read_only=True)
+    status_display = serializers.CharField(source="get_status_display", read_only=True)
+
+    class Meta:
+        model = OperationReceipt
+        fields = [
+            "id", "device_no", "op_id", "seq", "op_type", "occurred_at",
+            "payload", "batch_no", "received_at",
+            "status", "status_display", "result", "error", "attempts", "processed_at",
+        ]
+        read_only_fields = fields
 
 
 class ProblemEventSerializer(serializers.ModelSerializer):

@@ -2,8 +2,8 @@
     "openapi": "3.0.3",
     "info": {
         "title": "街道环卫考核 API",
-        "version": "1.0.0",
-        "description": "道路网格 / 保洁合同 / 问题事件 / 证据照片 / 处罚单元管理。\n\n核心规则：\n* 照片感知哈希(pHash)只用于生成**疑似重复候选**，是否同一问题由人工结合位置、时间判断；\n* 同一问题不同角度拍摄只计扣一次（照片挂接到已有事件）；\n* 已整改后同一位置复发 = 新事件、新处罚；\n* 扣分归属按**事件发生时**的合同责任区间，与录入时间无关；\n* 逾期升级基于可注入时钟；复核通过锁定处罚版本，更正只能追加新版本。"
+        "version": "1.1.0",
+        "description": "道路网格 / 保洁合同 / 问题事件 / 证据照片 / 处罚单元管理。\n\n核心规则：\n* 照片感知哈希(pHash)只用于生成**疑似重复候选**，是否同一问题由人工结合位置、时间判断；\n* 同一问题不同角度拍摄只计扣一次（照片挂接到已有事件）；\n* 已整改后同一位置复发 = 新事件、新处罚；\n* 扣分归属按**事件发生时**的合同责任区间，与录入时间无关；\n* 逾期升级基于可注入时钟；复核通过锁定处罚版本，更正只能追加新版本。\n\n离线采集包接入（/api/ingest/）：\n* 设备先上传暂存媒体（按 media_key 幂等），再批量上送操作（稳定操作号 + 设备内序号 + 业务发生时间 + 照片引用）；\n* 服务端保存不可变接收账本、设备水位与逐条回执；同一操作重放返回原结果；\n* 缺失前序的操作保持待处理，补齐后按序号顺序执行；失败可重试，不留半个业务结果。"
     },
     "paths": {
         "/api/candidates/": {
@@ -1085,6 +1085,453 @@
                 }
             }
         },
+        "/api/ingest/batches/": {
+            "post": {
+                "operationId": "ingest_batches_create",
+                "description": "采集包批量接入：同一设备的一批操作，逐条入账、按序执行、逐条回执。",
+                "tags": [
+                    "ingest"
+                ],
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/IngestBatch"
+                            }
+                        },
+                        "application/x-www-form-urlencoded": {
+                            "schema": {
+                                "$ref": "#/components/schemas/IngestBatch"
+                            }
+                        },
+                        "multipart/form-data": {
+                            "schema": {
+                                "$ref": "#/components/schemas/IngestBatch"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "security": [
+                    {
+                        "cookieAuth": []
+                    },
+                    {
+                        "basicAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/IngestBatchResponse"
+                                }
+                            }
+                        },
+                        "description": ""
+                    }
+                }
+            }
+        },
+        "/api/ingest/devices/": {
+            "get": {
+                "operationId": "ingest_devices_list",
+                "description": "采集设备状态：接收/处理水位与各状态回执数量（只读，设备在接入时自动登记）。",
+                "parameters": [
+                    {
+                        "name": "page",
+                        "required": false,
+                        "in": "query",
+                        "description": "分页结果集中的页码。",
+                        "schema": {
+                            "type": "integer"
+                        }
+                    }
+                ],
+                "tags": [
+                    "ingest"
+                ],
+                "security": [
+                    {
+                        "cookieAuth": []
+                    },
+                    {
+                        "basicAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/PaginatedCollectionDeviceList"
+                                }
+                            }
+                        },
+                        "description": ""
+                    }
+                }
+            }
+        },
+        "/api/ingest/devices/{device_no}/": {
+            "get": {
+                "operationId": "ingest_devices_retrieve",
+                "description": "采集设备状态：接收/处理水位与各状态回执数量（只读，设备在接入时自动登记）。",
+                "parameters": [
+                    {
+                        "in": "path",
+                        "name": "device_no",
+                        "schema": {
+                            "type": "string",
+                            "title": "设备编号"
+                        },
+                        "required": true
+                    }
+                ],
+                "tags": [
+                    "ingest"
+                ],
+                "security": [
+                    {
+                        "cookieAuth": []
+                    },
+                    {
+                        "basicAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/CollectionDevice"
+                                }
+                            }
+                        },
+                        "description": ""
+                    }
+                }
+            }
+        },
+        "/api/ingest/media/": {
+            "get": {
+                "operationId": "ingest_media_list",
+                "description": "暂存媒体：设备先上传照片文件，再在采集包操作中按 media_key 引用。\n上传按 (设备, media_key) 幂等——中断重传返回原记录（200），同键不同内容 409。\n暂存媒体只读不可改删；被操作成功消费后才转为证据照片。",
+                "parameters": [
+                    {
+                        "in": "query",
+                        "name": "device__device_no",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    {
+                        "name": "page",
+                        "required": false,
+                        "in": "query",
+                        "description": "分页结果集中的页码。",
+                        "schema": {
+                            "type": "integer"
+                        }
+                    },
+                    {
+                        "in": "query",
+                        "name": "status",
+                        "schema": {
+                            "type": "string",
+                            "title": "状态",
+                            "enum": [
+                                "consumed",
+                                "staged"
+                            ]
+                        },
+                        "description": "* `staged` - 已暂存（待引用）\n* `consumed` - 已消费（已转为证据照片）"
+                    }
+                ],
+                "tags": [
+                    "ingest"
+                ],
+                "security": [
+                    {
+                        "cookieAuth": []
+                    },
+                    {
+                        "basicAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/PaginatedStagedMediaReadList"
+                                }
+                            }
+                        },
+                        "description": ""
+                    }
+                }
+            },
+            "post": {
+                "operationId": "ingest_media_create",
+                "description": "暂存媒体：设备先上传照片文件，再在采集包操作中按 media_key 引用。\n上传按 (设备, media_key) 幂等——中断重传返回原记录（200），同键不同内容 409。\n暂存媒体只读不可改删；被操作成功消费后才转为证据照片。",
+                "tags": [
+                    "ingest"
+                ],
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/StagedMediaUpload"
+                            }
+                        },
+                        "application/x-www-form-urlencoded": {
+                            "schema": {
+                                "$ref": "#/components/schemas/StagedMediaUpload"
+                            }
+                        },
+                        "multipart/form-data": {
+                            "schema": {
+                                "$ref": "#/components/schemas/StagedMediaUpload"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "security": [
+                    {
+                        "cookieAuth": []
+                    },
+                    {
+                        "basicAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "201": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/StagedMediaRead"
+                                }
+                            }
+                        },
+                        "description": ""
+                    }
+                }
+            }
+        },
+        "/api/ingest/media/{id}/": {
+            "get": {
+                "operationId": "ingest_media_retrieve",
+                "description": "暂存媒体：设备先上传照片文件，再在采集包操作中按 media_key 引用。\n上传按 (设备, media_key) 幂等——中断重传返回原记录（200），同键不同内容 409。\n暂存媒体只读不可改删；被操作成功消费后才转为证据照片。",
+                "parameters": [
+                    {
+                        "in": "path",
+                        "name": "id",
+                        "schema": {
+                            "type": "integer"
+                        },
+                        "description": "标识此 暂存媒体 的 唯一整数值。",
+                        "required": true
+                    }
+                ],
+                "tags": [
+                    "ingest"
+                ],
+                "security": [
+                    {
+                        "cookieAuth": []
+                    },
+                    {
+                        "basicAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/StagedMediaRead"
+                                }
+                            }
+                        },
+                        "description": ""
+                    }
+                }
+            }
+        },
+        "/api/ingest/receipts/": {
+            "get": {
+                "operationId": "ingest_receipts_list",
+                "description": "逐条回执查询（含账本原文）与失败重试。",
+                "parameters": [
+                    {
+                        "in": "query",
+                        "name": "operation__batch_no",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    {
+                        "in": "query",
+                        "name": "operation__device__device_no",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    {
+                        "in": "query",
+                        "name": "operation__op_type",
+                        "schema": {
+                            "type": "string",
+                            "title": "操作类型",
+                            "enum": [
+                                "photo_report",
+                                "rectification"
+                            ]
+                        },
+                        "description": "* `photo_report` - 问题照片立案\n* `rectification` - 整改回执"
+                    },
+                    {
+                        "name": "page",
+                        "required": false,
+                        "in": "query",
+                        "description": "分页结果集中的页码。",
+                        "schema": {
+                            "type": "integer"
+                        }
+                    },
+                    {
+                        "in": "query",
+                        "name": "status",
+                        "schema": {
+                            "type": "string",
+                            "title": "处理状态",
+                            "enum": [
+                                "applied",
+                                "failed",
+                                "ignored",
+                                "pending"
+                            ]
+                        },
+                        "description": "* `pending` - 待处理（前序未齐）\n* `applied` - 已执行\n* `ignored` - 已忽略（业务幂等拒绝，如迟到的重复整改）\n* `failed` - 执行失败（可重试）"
+                    }
+                ],
+                "tags": [
+                    "ingest"
+                ],
+                "security": [
+                    {
+                        "cookieAuth": []
+                    },
+                    {
+                        "basicAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/PaginatedOperationReceiptList"
+                                }
+                            }
+                        },
+                        "description": ""
+                    }
+                }
+            }
+        },
+        "/api/ingest/receipts/{id}/": {
+            "get": {
+                "operationId": "ingest_receipts_retrieve",
+                "description": "逐条回执查询（含账本原文）与失败重试。",
+                "parameters": [
+                    {
+                        "in": "path",
+                        "name": "id",
+                        "schema": {
+                            "type": "integer"
+                        },
+                        "description": "标识此 操作回执 的 唯一整数值。",
+                        "required": true
+                    }
+                ],
+                "tags": [
+                    "ingest"
+                ],
+                "security": [
+                    {
+                        "cookieAuth": []
+                    },
+                    {
+                        "basicAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/OperationReceipt"
+                                }
+                            }
+                        },
+                        "description": ""
+                    }
+                }
+            }
+        },
+        "/api/ingest/receipts/{id}/retry/": {
+            "post": {
+                "operationId": "ingest_receipts_retry_create",
+                "description": "重试失败的回执：复位后从设备水位处重新按序级联执行。\n仅 failed 状态可重试，其余状态 409。",
+                "parameters": [
+                    {
+                        "in": "path",
+                        "name": "id",
+                        "schema": {
+                            "type": "integer"
+                        },
+                        "description": "标识此 操作回执 的 唯一整数值。",
+                        "required": true
+                    }
+                ],
+                "tags": [
+                    "ingest"
+                ],
+                "security": [
+                    {
+                        "cookieAuth": []
+                    },
+                    {
+                        "basicAuth": []
+                    },
+                    {}
+                ],
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/OperationReceipt"
+                                }
+                            }
+                        },
+                        "description": ""
+                    }
+                }
+            }
+        },
         "/api/penalties/": {
             "get": {
                 "operationId": "penalties_list",
@@ -1933,6 +2380,77 @@
                     "valid_to"
                 ]
             },
+            "CollectionDevice": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "integer",
+                        "readOnly": true
+                    },
+                    "device_no": {
+                        "type": "string",
+                        "readOnly": true,
+                        "title": "设备编号"
+                    },
+                    "name": {
+                        "type": "string",
+                        "readOnly": true,
+                        "title": "设备名称"
+                    },
+                    "received_watermark": {
+                        "type": "integer",
+                        "readOnly": true,
+                        "title": "已连续接收序号"
+                    },
+                    "applied_watermark": {
+                        "type": "integer",
+                        "readOnly": true,
+                        "title": "已连续处理序号"
+                    },
+                    "last_seen_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "readOnly": true,
+                        "nullable": true,
+                        "title": "最近通信时间"
+                    },
+                    "applied_count": {
+                        "type": "integer",
+                        "readOnly": true
+                    },
+                    "pending_count": {
+                        "type": "integer",
+                        "readOnly": true
+                    },
+                    "ignored_count": {
+                        "type": "integer",
+                        "readOnly": true
+                    },
+                    "failed_count": {
+                        "type": "integer",
+                        "readOnly": true
+                    },
+                    "created_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "readOnly": true,
+                        "title": "创建时间"
+                    }
+                },
+                "required": [
+                    "applied_count",
+                    "applied_watermark",
+                    "created_at",
+                    "device_no",
+                    "failed_count",
+                    "id",
+                    "ignored_count",
+                    "last_seen_at",
+                    "name",
+                    "pending_count",
+                    "received_watermark"
+                ]
+            },
             "DuplicateCandidate": {
                 "type": "object",
                 "properties": {
@@ -2246,6 +2764,238 @@
                     "phash"
                 ]
             },
+            "IngestBatch": {
+                "type": "object",
+                "description": "采集包：同一设备的一批操作。逐条入账，逐条回执。",
+                "properties": {
+                    "device_no": {
+                        "type": "string",
+                        "maxLength": 64
+                    },
+                    "batch_no": {
+                        "type": "string",
+                        "default": "",
+                        "maxLength": 64
+                    },
+                    "operations": {
+                        "type": "array",
+                        "items": {
+                            "$ref": "#/components/schemas/IngestOperation"
+                        }
+                    }
+                },
+                "required": [
+                    "device_no",
+                    "operations"
+                ]
+            },
+            "IngestBatchResponse": {
+                "type": "object",
+                "properties": {
+                    "device_no": {
+                        "type": "string"
+                    },
+                    "received_watermark": {
+                        "type": "integer"
+                    },
+                    "applied_watermark": {
+                        "type": "integer"
+                    },
+                    "receipts": {
+                        "type": "array",
+                        "items": {
+                            "$ref": "#/components/schemas/IngestReceiptItem"
+                        }
+                    }
+                },
+                "required": [
+                    "applied_watermark",
+                    "device_no",
+                    "receipts",
+                    "received_watermark"
+                ]
+            },
+            "IngestOperation": {
+                "type": "object",
+                "description": "单条设备操作：稳定操作号 + 设备内序号 + 业务发生时间 + 业务参数。",
+                "properties": {
+                    "op_id": {
+                        "type": "string",
+                        "maxLength": 64
+                    },
+                    "seq": {
+                        "type": "integer",
+                        "minimum": 1
+                    },
+                    "type": {
+                        "$ref": "#/components/schemas/TypeEnum"
+                    },
+                    "occurred_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "业务发生时间（归属/整改均以它为准）"
+                    },
+                    "payload": {}
+                },
+                "required": [
+                    "occurred_at",
+                    "op_id",
+                    "payload",
+                    "seq",
+                    "type"
+                ]
+            },
+            "IngestReceiptItem": {
+                "type": "object",
+                "description": "批量接入响应中的逐条回执（status=conflict 表示与账本冲突、未入账）。",
+                "properties": {
+                    "receipt_id": {
+                        "type": "integer",
+                        "nullable": true
+                    },
+                    "op_id": {
+                        "type": "string"
+                    },
+                    "seq": {
+                        "type": "integer"
+                    },
+                    "status": {
+                        "$ref": "#/components/schemas/IngestReceiptItemStatusEnum"
+                    },
+                    "replayed": {
+                        "type": "boolean"
+                    },
+                    "result": {
+                        "nullable": true
+                    },
+                    "error": {
+                        "nullable": true
+                    }
+                },
+                "required": [
+                    "error",
+                    "op_id",
+                    "receipt_id",
+                    "replayed",
+                    "result",
+                    "seq",
+                    "status"
+                ]
+            },
+            "IngestReceiptItemStatusEnum": {
+                "enum": [
+                    "pending",
+                    "applied",
+                    "ignored",
+                    "failed",
+                    "conflict"
+                ],
+                "type": "string",
+                "description": "* `pending` - pending\n* `applied` - applied\n* `ignored` - ignored\n* `failed` - failed\n* `conflict` - conflict"
+            },
+            "OperationReceipt": {
+                "type": "object",
+                "description": "逐条回执（含账本原文，支撑全链路追溯）。",
+                "properties": {
+                    "id": {
+                        "type": "integer",
+                        "readOnly": true
+                    },
+                    "device_no": {
+                        "type": "string",
+                        "readOnly": true
+                    },
+                    "op_id": {
+                        "type": "string",
+                        "readOnly": true
+                    },
+                    "seq": {
+                        "type": "integer",
+                        "readOnly": true
+                    },
+                    "op_type": {
+                        "type": "string",
+                        "readOnly": true
+                    },
+                    "occurred_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "readOnly": true
+                    },
+                    "payload": {
+                        "readOnly": true
+                    },
+                    "batch_no": {
+                        "type": "string",
+                        "readOnly": true
+                    },
+                    "received_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "readOnly": true
+                    },
+                    "status": {
+                        "allOf": [
+                            {
+                                "$ref": "#/components/schemas/OperationReceiptStatusEnum"
+                            }
+                        ],
+                        "readOnly": true,
+                        "title": "处理状态"
+                    },
+                    "status_display": {
+                        "type": "string",
+                        "readOnly": true
+                    },
+                    "result": {
+                        "readOnly": true,
+                        "title": "业务结果快照"
+                    },
+                    "error": {
+                        "readOnly": true,
+                        "title": "失败信息"
+                    },
+                    "attempts": {
+                        "type": "integer",
+                        "readOnly": true,
+                        "title": "执行次数"
+                    },
+                    "processed_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "readOnly": true,
+                        "nullable": true,
+                        "title": "处理时间"
+                    }
+                },
+                "required": [
+                    "attempts",
+                    "batch_no",
+                    "device_no",
+                    "error",
+                    "id",
+                    "occurred_at",
+                    "op_id",
+                    "op_type",
+                    "payload",
+                    "processed_at",
+                    "received_at",
+                    "result",
+                    "seq",
+                    "status",
+                    "status_display"
+                ]
+            },
+            "OperationReceiptStatusEnum": {
+                "enum": [
+                    "pending",
+                    "applied",
+                    "ignored",
+                    "failed"
+                ],
+                "type": "string",
+                "description": "* `pending` - 待处理（前序未齐）\n* `applied` - 已执行\n* `ignored` - 已忽略（业务幂等拒绝，如迟到的重复整改）\n* `failed` - 执行失败（可重试）"
+            },
             "PaginatedCleaningContractList": {
                 "type": "object",
                 "required": [
@@ -2273,6 +3023,37 @@
                         "type": "array",
                         "items": {
                             "$ref": "#/components/schemas/CleaningContract"
+                        }
+                    }
+                }
+            },
+            "PaginatedCollectionDeviceList": {
+                "type": "object",
+                "required": [
+                    "count",
+                    "results"
+                ],
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "example": 123
+                    },
+                    "next": {
+                        "type": "string",
+                        "nullable": true,
+                        "format": "uri",
+                        "example": "http://api.example.org/accounts/?page=4"
+                    },
+                    "previous": {
+                        "type": "string",
+                        "nullable": true,
+                        "format": "uri",
+                        "example": "http://api.example.org/accounts/?page=2"
+                    },
+                    "results": {
+                        "type": "array",
+                        "items": {
+                            "$ref": "#/components/schemas/CollectionDevice"
                         }
                     }
                 }
@@ -2366,6 +3147,37 @@
                         "type": "array",
                         "items": {
                             "$ref": "#/components/schemas/EvidencePhoto"
+                        }
+                    }
+                }
+            },
+            "PaginatedOperationReceiptList": {
+                "type": "object",
+                "required": [
+                    "count",
+                    "results"
+                ],
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "example": 123
+                    },
+                    "next": {
+                        "type": "string",
+                        "nullable": true,
+                        "format": "uri",
+                        "example": "http://api.example.org/accounts/?page=4"
+                    },
+                    "previous": {
+                        "type": "string",
+                        "nullable": true,
+                        "format": "uri",
+                        "example": "http://api.example.org/accounts/?page=2"
+                    },
+                    "results": {
+                        "type": "array",
+                        "items": {
+                            "$ref": "#/components/schemas/OperationReceipt"
                         }
                     }
                 }
@@ -2521,6 +3333,37 @@
                         "type": "array",
                         "items": {
                             "$ref": "#/components/schemas/RoadGrid"
+                        }
+                    }
+                }
+            },
+            "PaginatedStagedMediaReadList": {
+                "type": "object",
+                "required": [
+                    "count",
+                    "results"
+                ],
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "example": 123
+                    },
+                    "next": {
+                        "type": "string",
+                        "nullable": true,
+                        "format": "uri",
+                        "example": "http://api.example.org/accounts/?page=4"
+                    },
+                    "previous": {
+                        "type": "string",
+                        "nullable": true,
+                        "format": "uri",
+                        "example": "http://api.example.org/accounts/?page=2"
+                    },
+                    "results": {
+                        "type": "array",
+                        "items": {
+                            "$ref": "#/components/schemas/StagedMediaRead"
                         }
                     }
                 }
@@ -3242,6 +4085,111 @@
                     "geom",
                     "id"
                 ]
+            },
+            "StagedMediaRead": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "integer",
+                        "readOnly": true
+                    },
+                    "device_no": {
+                        "type": "string",
+                        "readOnly": true
+                    },
+                    "media_key": {
+                        "type": "string",
+                        "readOnly": true,
+                        "title": "客户端媒体键"
+                    },
+                    "image": {
+                        "type": "string",
+                        "format": "uri",
+                        "nullable": true,
+                        "readOnly": true,
+                        "title": "图片文件"
+                    },
+                    "sha256": {
+                        "type": "string",
+                        "readOnly": true,
+                        "title": "内容SHA256"
+                    },
+                    "status": {
+                        "allOf": [
+                            {
+                                "$ref": "#/components/schemas/StagedMediaReadStatusEnum"
+                            }
+                        ],
+                        "readOnly": true,
+                        "title": "状态"
+                    },
+                    "status_display": {
+                        "type": "string",
+                        "readOnly": true
+                    },
+                    "consumed_by": {
+                        "type": "integer",
+                        "readOnly": true,
+                        "nullable": true,
+                        "title": "生成的证据照片"
+                    },
+                    "created_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "readOnly": true,
+                        "title": "创建时间"
+                    }
+                },
+                "required": [
+                    "consumed_by",
+                    "created_at",
+                    "device_no",
+                    "id",
+                    "image",
+                    "media_key",
+                    "sha256",
+                    "status",
+                    "status_display"
+                ]
+            },
+            "StagedMediaReadStatusEnum": {
+                "enum": [
+                    "staged",
+                    "consumed"
+                ],
+                "type": "string",
+                "description": "* `staged` - 已暂存（待引用）\n* `consumed` - 已消费（已转为证据照片）"
+            },
+            "StagedMediaUpload": {
+                "type": "object",
+                "description": "暂存媒体上传（multipart）。同一 (设备, media_key) 重传幂等。",
+                "properties": {
+                    "device_no": {
+                        "type": "string",
+                        "maxLength": 64
+                    },
+                    "media_key": {
+                        "type": "string",
+                        "maxLength": 64
+                    },
+                    "image": {
+                        "type": "string",
+                        "format": "uri"
+                    }
+                },
+                "required": [
+                    "device_no",
+                    "image",
+                    "media_key"
+                ]
+            },
+            "TypeEnum": {
+                "enum": [
+                    "photo_report",
+                    "rectification"
+                ],
+                "type": "string",
+                "description": "* `photo_report` - 问题照片立案\n* `rectification` - 整改回执"
             }
         },
         "securitySchemes": {

@@ -53,6 +53,26 @@ class PhotoAlreadyLinked(DomainError):
     default_detail = "照片已关联事件，不能重复立案"
 
 
+class MediaKeyConflict(DomainError):
+    status_code = 409
+    default_detail = "相同媒体键的媒体已存在，但文件内容不一致"
+
+
+class MediaNotAvailable(DomainError):
+    status_code = 422
+    default_detail = "操作引用的媒体不存在或已被消费，请先上传媒体再重试"
+
+
+class InvalidReference(DomainError):
+    status_code = 422
+    default_detail = "操作引用的业务对象不存在或状态不满足"
+
+
+class InvalidRetry(DomainError):
+    status_code = 409
+    default_detail = "仅失败状态的回执可以重试"
+
+
 def api_exception_handler(exc, context):
     """把 DomainError 转成 DRF 的标准错误响应体。"""
     from rest_framework.exceptions import APIException

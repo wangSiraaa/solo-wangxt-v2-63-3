@@ -10,6 +10,12 @@
                      PenaltyUnit 1:1（唯一扣分单元，归属发生时的合同）
                               │
               PenaltyVersion（只追加、不可变）/ ReviewRecord / EscalationRecord
+
+离线采集包接入：
+  CollectionDevice（设备 + 接收/处理水位）
+      ├──< StagedMedia（暂存媒体，按 media_key 幂等，消费后转为证据照片）
+      └──< IngestedOperation（不可变接收账本：op_id/seq 双唯一）
+                  └── OperationReceipt 1:1（逐条回执：状态 + 结果快照）
 """
 import uuid
 
@@ -293,6 +299,132 @@ class EscalationRecord(models.Model):
             models.UniqueConstraint(fields=["penalty", "level"], name="uniq_escalation_level"),
         ]
         ordering = ["penalty_id", "level"]
+
+
+class CollectionDevice(TimeStamped):
+    """
+    离线采集设备。服务端按设备维护两个水位（设备内序号从 1 起连续递增）：
+    * received_watermark —— 已连续接收到的最大序号；
+    * applied_watermark  —— 已连续处理（执行或忽略）到的最大序号。
+    缺口之后的操作只入账不执行，补齐后按序号顺序执行。
+    """
+
+    device_no = models.CharField("设备编号", max_length=64, unique=True)
+    name = models.CharField("设备名称", max_length=128, blank=True)
+    received_watermark = models.PositiveIntegerField("已连续接收序号", default=0)
+    applied_watermark = models.PositiveIntegerField("已连续处理序号", default=0)
+    last_seen_at = models.DateTimeField("最近通信时间", null=True, blank=True)
+
+    class Meta:
+        verbose_name = "采集设备"
+        verbose_name_plural = verbose_name
+
+    def __str__(self):
+        return self.device_no
+
+
+class StagedMedia(TimeStamped):
+    """
+    暂存媒体：设备先上传照片文件，再在操作中按 media_key 引用。
+    按 (设备, media_key) 幂等——上传中断后用同一 media_key 重传返回原记录；
+    同键不同内容视为冲突（409）。只有被操作成功消费才转为 EvidencePhoto，
+    暂存区本身不产生证据、候选或任何业务结果，因此可安全重试。
+    """
+
+    class Status(models.TextChoices):
+        STAGED = "staged", "已暂存（待引用）"
+        CONSUMED = "consumed", "已消费（已转为证据照片）"
+
+    device = models.ForeignKey(
+        CollectionDevice, on_delete=models.PROTECT, related_name="staged_media", verbose_name="采集设备",
+    )
+    media_key = models.CharField("客户端媒体键", max_length=64)
+    image = models.ImageField("图片文件", upload_to="staged/%Y/%m/%d")
+    sha256 = models.CharField("内容SHA256", max_length=64, editable=False)
+    status = models.CharField("状态", max_length=16, choices=Status.choices, default=Status.STAGED)
+    consumed_by = models.ForeignKey(
+        EvidencePhoto, on_delete=models.PROTECT, related_name="staged_sources",
+        null=True, blank=True, verbose_name="生成的证据照片",
+    )
+
+    class Meta:
+        verbose_name = "暂存媒体"
+        verbose_name_plural = verbose_name
+        constraints = [
+            models.UniqueConstraint(fields=["device", "media_key"], name="uniq_staged_media_key"),
+        ]
+
+    def __str__(self):
+        return f"{self.device_id}:{self.media_key}"
+
+
+class IngestedOperation(models.Model):
+    """
+    接收账本（不可变，append-only）：每条设备操作只插入一次，之后永不修改。
+    * (设备, op_id) 唯一 —— 同一操作重放返回原回执；内容指纹不一致视为冲突；
+    * (设备, seq)   唯一 —— 设备内序号不可复用；
+    处理状态与结果快照见 OperationReceipt（账本与回执分离，账本保持不可变）。
+    """
+
+    class OpType(models.TextChoices):
+        PHOTO_REPORT = "photo_report", "问题照片立案"
+        RECTIFICATION = "rectification", "整改回执"
+
+    device = models.ForeignKey(
+        CollectionDevice, on_delete=models.PROTECT, related_name="operations", verbose_name="采集设备",
+    )
+    op_id = models.CharField("稳定操作号", max_length=64)
+    seq = models.PositiveIntegerField("设备内序号")
+    op_type = models.CharField("操作类型", max_length=24, choices=OpType.choices)
+    occurred_at = models.DateTimeField("业务发生时间", help_text="归属/整改时间以该时间为准，而不是接收时间")
+    payload = models.JSONField("业务参数（含照片引用）", default=dict)
+    payload_hash = models.CharField("内容指纹(SHA256)", max_length=64, editable=False)
+    batch_no = models.CharField("客户端批次号", max_length=64, blank=True, default="")
+    received_at = models.DateTimeField("接收时间", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "接收账本"
+        verbose_name_plural = verbose_name
+        ordering = ["device_id", "seq"]
+        constraints = [
+            models.UniqueConstraint(fields=["device", "op_id"], name="uniq_device_op_id"),
+            models.UniqueConstraint(fields=["device", "seq"], name="uniq_device_seq"),
+        ]
+
+    def __str__(self):
+        return f"{self.device_id}:{self.seq} {self.op_type}"
+
+
+class OperationReceipt(TimeStamped):
+    """
+    逐条回执：跟踪账本中每条操作的处理状态与业务结果快照。
+    重放同一操作返回该快照（原结果），不重新执行；
+    failed 可经重试 API 重新执行，成功后级联处理后续待处理序号。
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "待处理（前序未齐）"
+        APPLIED = "applied", "已执行"
+        IGNORED = "ignored", "已忽略（业务幂等拒绝，如迟到的重复整改）"
+        FAILED = "failed", "执行失败（可重试）"
+
+    operation = models.OneToOneField(
+        IngestedOperation, on_delete=models.PROTECT, related_name="receipt", verbose_name="接收账本",
+    )
+    status = models.CharField("处理状态", max_length=16, choices=Status.choices, default=Status.PENDING)
+    result = models.JSONField("业务结果快照", default=dict, blank=True)
+    error = models.JSONField("失败信息", default=dict, blank=True)
+    attempts = models.PositiveIntegerField("执行次数", default=0)
+    processed_at = models.DateTimeField("处理时间", null=True, blank=True)
+
+    class Meta:
+        verbose_name = "操作回执"
+        verbose_name_plural = verbose_name
+        ordering = ["id"]
+        indexes = [models.Index(fields=["status"])]
+
+    def __str__(self):
+        return f"{self.operation_id} {self.status}"
 
 
 class ReviewRecord(models.Model):

@@ -119,9 +119,14 @@ SPECTACULAR_SETTINGS = {
         "* 同一问题不同角度拍摄只计扣一次（照片挂接到已有事件）；\n"
         "* 已整改后同一位置复发 = 新事件、新处罚；\n"
         "* 扣分归属按**事件发生时**的合同责任区间，与录入时间无关；\n"
-        "* 逾期升级基于可注入时钟；复核通过锁定处罚版本，更正只能追加新版本。"
+        "* 逾期升级基于可注入时钟；复核通过锁定处罚版本，更正只能追加新版本。\n\n"
+        "离线采集包接入（/api/ingest/）：\n"
+        "* 设备先上传暂存媒体（按 media_key 幂等），再批量上送操作"
+        "（稳定操作号 + 设备内序号 + 业务发生时间 + 照片引用）；\n"
+        "* 服务端保存不可变接收账本、设备水位与逐条回执；同一操作重放返回原结果；\n"
+        "* 缺失前序的操作保持待处理，补齐后按序号顺序执行；失败可重试，不留半个业务结果。"
     ),
-    "VERSION": "1.0.0",
+    "VERSION": "1.1.0",
     "ENUM_NAME_OVERRIDES": {
         "EventStatusEnum": "assessment.models.ProblemEvent.Status",
         "EventCategoryEnum": "assessment.models.ProblemEvent.Category",

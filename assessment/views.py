@@ -1,27 +1,37 @@
 """API 视图。所有写操作都委托给 services 层（领域规则集中、时钟可注入）。"""
+from django.db.models import Count, Q
+from drf_spectacular.utils import extend_schema
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from assessment.models import (
     CleaningContract,
+    CollectionDevice,
     DuplicateCandidate,
     EscalationRecord,
     EvidencePhoto,
+    OperationReceipt,
     PenaltyUnit,
     PenaltyVersion,
     ProblemEvent,
     Rectification,
     RoadGrid,
+    StagedMedia,
 )
 from assessment.serializers import (
     CandidateDecisionSerializer,
     CleaningContractSerializer,
+    CollectionDeviceSerializer,
     CreateEventFromPhotoSerializer,
     DuplicateCandidateSerializer,
     EscalationRecordSerializer,
     EscalationRunSerializer,
     EvidencePhotoSerializer,
+    IngestBatchResponseSerializer,
+    IngestBatchSerializer,
+    OperationReceiptSerializer,
     PenaltyCorrectionSerializer,
     PenaltyReviewSerializer,
     PenaltyUnitSerializer,
@@ -30,11 +40,14 @@ from assessment.serializers import (
     RectificationReadSerializer,
     RectifyRequestSerializer,
     RoadGridSerializer,
+    StagedMediaReadSerializer,
+    StagedMediaUploadSerializer,
 )
 from assessment.services.clock import resolve_clock
 from assessment.services.decisions import decide_candidate
 from assessment.services.escalation import run_escalation
 from assessment.services.events import create_event_from_photo
+from assessment.services.ingest import ingest_batch, retry_operation, stage_media
 from assessment.services.penalties import correct_penalty, review_penalty
 from assessment.services.rectification import submit_rectification
 
@@ -254,3 +267,94 @@ class EscalationRecordViewSet(viewsets.mixins.RetrieveModelMixin,
             },
             status=status.HTTP_201_CREATED if result.created_count else status.HTTP_200_OK,
         )
+
+
+# ---------------------------------------------------------------- 采集包接入
+
+
+class IngestMediaViewSet(viewsets.mixins.CreateModelMixin,
+                         viewsets.mixins.RetrieveModelMixin,
+                         viewsets.mixins.ListModelMixin,
+                         viewsets.GenericViewSet):
+    """
+    暂存媒体：设备先上传照片文件，再在采集包操作中按 media_key 引用。
+    上传按 (设备, media_key) 幂等——中断重传返回原记录（200），同键不同内容 409。
+    暂存媒体只读不可改删；被操作成功消费后才转为证据照片。
+    """
+
+    queryset = StagedMedia.objects.select_related("device").all()
+    filterset_fields = ["status", "device__device_no"]
+
+    def get_serializer_class(self):
+        if self.action == "create":
+            return StagedMediaUploadSerializer
+        return StagedMediaReadSerializer
+
+    @extend_schema(responses=StagedMediaReadSerializer)
+    def create(self, request, *args, **kwargs):
+        payload = StagedMediaUploadSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        data = payload.validated_data
+        media, created = stage_media(
+            device_no=data["device_no"],
+            media_key=data["media_key"],
+            image_file=data["image"],
+        )
+        return Response(
+            StagedMediaReadSerializer(media).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class IngestBatchView(APIView):
+    """采集包批量接入：同一设备的一批操作，逐条入账、按序执行、逐条回执。"""
+
+    @extend_schema(request=IngestBatchSerializer, responses=IngestBatchResponseSerializer)
+    def post(self, request):
+        payload = IngestBatchSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        data = payload.validated_data
+        result = ingest_batch(
+            device_no=data["device_no"],
+            operations=data["operations"],
+            batch_no=data.get("batch_no", ""),
+        )
+        return Response(result, status=status.HTTP_201_CREATED)
+
+
+class IngestDeviceViewSet(viewsets.mixins.RetrieveModelMixin,
+                          viewsets.mixins.ListModelMixin,
+                          viewsets.GenericViewSet):
+    """采集设备状态：接收/处理水位与各状态回执数量（只读，设备在接入时自动登记）。"""
+
+    lookup_field = "device_no"
+    serializer_class = CollectionDeviceSerializer
+
+    def get_queryset(self):
+        counts = {
+            f"{status}_count": Count("operations__receipt", filter=Q(operations__receipt__status=status))
+            for status in ("applied", "pending", "ignored", "failed")
+        }
+        return CollectionDevice.objects.annotate(**counts)
+
+
+class IngestReceiptViewSet(viewsets.mixins.RetrieveModelMixin,
+                           viewsets.mixins.ListModelMixin,
+                           viewsets.GenericViewSet):
+    """逐条回执查询（含账本原文）与失败重试。"""
+
+    queryset = OperationReceipt.objects.select_related("operation", "operation__device").all()
+    serializer_class = OperationReceiptSerializer
+    filterset_fields = [
+        "status", "operation__op_type", "operation__batch_no", "operation__device__device_no",
+    ]
+
+    @extend_schema(request=None, responses=OperationReceiptSerializer)
+    @action(detail=True, methods=["post"])
+    def retry(self, request, pk=None):
+        """
+        重试失败的回执：复位后从设备水位处重新按序级联执行。
+        仅 failed 状态可重试，其余状态 409。
+        """
+        receipt = retry_operation(self.get_object())
+        return Response(OperationReceiptSerializer(receipt).data)

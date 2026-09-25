@@ -53,6 +53,31 @@ class PhotoAlreadyLinked(DomainError):
     default_detail = "照片已关联事件，不能重复立案"
 
 
+class IngestConflict(DomainError):
+    status_code = 409
+    default_detail = "采集操作冲突：相同操作号/序号/媒体号已落账但内容不一致"
+
+
+class IngestReferenceNotFound(DomainError):
+    status_code = 422
+    default_detail = "采集操作引用的业务对象不存在或尚未成功处理"
+
+
+class AlreadyProcessed(DomainError):
+    status_code = 409
+    default_detail = "该操作已处理完成；重放请通过批量接入查询原回执，不能重复执行"
+
+
+class InvalidMedia(DomainError):
+    status_code = 400
+    default_detail = "媒体文件无法解析，请重新上传"
+
+
+class ImmutableLedger(DomainError):
+    status_code = 500
+    default_detail = "接收账本不可变：落账后不允许修改"
+
+
 def api_exception_handler(exc, context):
     """把 DomainError 转成 DRF 的标准错误响应体。"""
     from rest_framework.exceptions import APIException

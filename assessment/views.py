@@ -1,13 +1,17 @@
 """API 视图。所有写操作都委托给 services 层（领域规则集中、时钟可注入）。"""
+from drf_spectacular.utils import extend_schema
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from assessment.models import (
     CleaningContract,
+    DeviceWatermark,
     DuplicateCandidate,
     EscalationRecord,
     EvidencePhoto,
+    IngestMedia,
+    IngestOperation,
     PenaltyUnit,
     PenaltyVersion,
     ProblemEvent,
@@ -18,10 +22,16 @@ from assessment.serializers import (
     CandidateDecisionSerializer,
     CleaningContractSerializer,
     CreateEventFromPhotoSerializer,
+    DeviceWatermarkSerializer,
     DuplicateCandidateSerializer,
     EscalationRecordSerializer,
     EscalationRunSerializer,
     EvidencePhotoSerializer,
+    IngestBatchRequestSerializer,
+    IngestBatchResponseSerializer,
+    IngestMediaSerializer,
+    IngestOperationReadSerializer,
+    IngestReceiptSerializer,
     PenaltyCorrectionSerializer,
     PenaltyReviewSerializer,
     PenaltyUnitSerializer,
@@ -35,6 +45,7 @@ from assessment.services.clock import resolve_clock
 from assessment.services.decisions import decide_candidate
 from assessment.services.escalation import run_escalation
 from assessment.services.events import create_event_from_photo
+from assessment.services.ingest import ingest_batch, receipt_to_dict, retry_operation, store_media
 from assessment.services.penalties import correct_penalty, review_penalty
 from assessment.services.rectification import submit_rectification
 
@@ -254,3 +265,94 @@ class EscalationRecordViewSet(viewsets.mixins.RetrieveModelMixin,
             },
             status=status.HTTP_201_CREATED if result.created_count else status.HTTP_200_OK,
         )
+
+
+# ---------------------------------------------------------------------------
+# 离线采集包接入（纯 API，无界面）
+# ---------------------------------------------------------------------------
+
+
+class IngestBatchViewSet(viewsets.GenericViewSet):
+    """
+    采集包批量接入：设备离线操作按 (操作号, 设备内序号, 业务发生时间, 照片引用) 落账。
+    同一操作重放返回原回执；缺失前序的操作保持待处理，补齐后按序号顺序执行。
+    """
+
+    serializer_class = IngestBatchRequestSerializer
+
+    @extend_schema(request=IngestBatchRequestSerializer, responses=IngestBatchResponseSerializer)
+    def create(self, request):
+        payload = IngestBatchRequestSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        data = payload.validated_data
+        result = ingest_batch(device_id=data["device_id"], operations=data["operations"])
+        body = {
+            "device_id": result.device_id,
+            "watermark": result.watermark,
+            "receipts": [receipt_to_dict(op, replayed=replayed) for op, replayed in result.receipts],
+        }
+        any_new = any(not replayed for _, replayed in result.receipts)
+        return Response(
+            IngestBatchResponseSerializer(body).data,
+            status=status.HTTP_201_CREATED if any_new else status.HTTP_200_OK,
+        )
+
+
+class IngestMediaViewSet(viewsets.mixins.CreateModelMixin,
+                          viewsets.mixins.RetrieveModelMixin,
+                          viewsets.mixins.ListModelMixin,
+                          viewsets.GenericViewSet):
+    """
+    采集媒体暂存：multipart 上传 `media_id` + `device_id` + `image`。
+    按 media_id 幂等——上传中断后重传相同内容返回原记录（reused=true）；
+    内容不一致返回 409。媒体落盘后会唤醒等待它的待处理操作。
+    """
+
+    queryset = IngestMedia.objects.all()
+    serializer_class = IngestMediaSerializer
+    filterset_fields = ["device_id", "media_id"]
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        media, created = store_media(
+            device_id=serializer.validated_data["device_id"],
+            media_id=serializer.validated_data["media_id"],
+            image_file=serializer.validated_data["image"],
+        )
+        media._reused = not created
+        return Response(
+            self.get_serializer(media).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class IngestOperationViewSet(viewsets.mixins.RetrieveModelMixin,
+                             viewsets.mixins.ListModelMixin,
+                             viewsets.GenericViewSet):
+    """接收账本与逐条回执的状态查询（只读）+ 单条重试动作。"""
+
+    queryset = IngestOperation.objects.select_related("receipt").all()
+    serializer_class = IngestOperationReadSerializer
+    filterset_fields = ["device_id", "op_type", "receipt__status"]
+
+    @extend_schema(request=None, responses=IngestReceiptSerializer)
+    @action(detail=True, methods=["post"])
+    def retry(self, request, pk=None):
+        """
+        人工重试：rejected/failed 重置为待处理后按序重派；pending 触发一次处理循环；
+        已 processed 返回 409（重放请走批量接入，不能重复执行）。
+        """
+        op = self.get_object()
+        receipt = retry_operation(op.id)
+        return Response(IngestReceiptSerializer(receipt_to_dict(receipt.operation)).data)
+
+
+class IngestDeviceViewSet(viewsets.mixins.RetrieveModelMixin,
+                          viewsets.mixins.ListModelMixin,
+                          viewsets.GenericViewSet):
+    """设备水位：已连续接收/连续处理序号与各状态计数。"""
+
+    queryset = DeviceWatermark.objects.all()
+    serializer_class = DeviceWatermarkSerializer
+    lookup_field = "device_id"

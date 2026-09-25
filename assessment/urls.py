@@ -13,6 +13,10 @@ router.register("rectifications", views.RectificationViewSet, basename="rectific
 router.register("penalties", views.PenaltyUnitViewSet, basename="penalty")
 router.register("penalty-versions", views.PenaltyVersionViewSet, basename="penaltyversion")
 router.register("escalations", views.EscalationRecordViewSet, basename="escalation")
+router.register("ingest/batches", views.IngestBatchViewSet, basename="ingest-batch")
+router.register("ingest/media", views.IngestMediaViewSet, basename="ingest-media")
+router.register("ingest/operations", views.IngestOperationViewSet, basename="ingest-operation")
+router.register("ingest/devices", views.IngestDeviceViewSet, basename="ingest-device")
 
 urlpatterns = [
     path("", include(router.urls)),

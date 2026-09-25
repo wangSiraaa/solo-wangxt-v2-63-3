@@ -309,3 +309,136 @@ class ReviewRecord(models.Model):
         verbose_name = "复核记录"
         verbose_name_plural = verbose_name
         ordering = ["-reviewed_at"]
+
+
+# ---------------------------------------------------------------------------
+# 离线采集包接入：不可变接收账本 + 逐条回执 + 设备水位 + 媒体暂存。
+# 全部为新增表，不改动既有业务表——旧的直接上传接口与历史数据不受影响。
+# ---------------------------------------------------------------------------
+
+
+class DeviceWatermark(models.Model):
+    """
+    设备水位（每台巡查设备一行）：
+    * received_through  —— 已连续接收的最大设备内序号（1..N 无空洞）；
+    * processed_through —— 已连续进入终态(processed/rejected)的最大序号。
+    空洞（缺失前序）之后的操作一律保持待处理，绝不按到达顺序执行。
+    """
+
+    device_id = models.CharField("设备编号", max_length=64, unique=True)
+    received_through = models.PositiveIntegerField("已连续接收序号", default=0)
+    processed_through = models.PositiveIntegerField("已连续处理序号", default=0)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        verbose_name = "设备水位"
+        verbose_name_plural = verbose_name
+
+    def __str__(self):
+        return f"{self.device_id} recv={self.received_through} done={self.processed_through}"
+
+
+class IngestOperation(models.Model):
+    """
+    接收账本（不可变）：设备离线操作落账后永不修改、永不删除。
+    幂等键 = (device_id, operation_no)；设备内顺序 = (device_id, seq)。
+    处理状态不写账本，由关联的回执(IngestReceipt)承载并演进。
+    """
+
+    class OpType(models.TextChoices):
+        REPORT = "report", "问题上报（照片+立案资料）"
+        RECTIFY = "rectify", "整改回执"
+
+    device_id = models.CharField("设备编号", max_length=64, db_index=True)
+    operation_no = models.CharField("稳定操作号", max_length=64)
+    seq = models.PositiveIntegerField("设备内序号")
+    op_type = models.CharField("操作类型", max_length=16, choices=OpType.choices)
+    occurred_at = models.DateTimeField(
+        "业务发生时间", help_text="合同归属/整改时间一律以它为准，而非到达时间",
+    )
+    payload = models.JSONField("业务载荷")
+    payload_hash = models.CharField("载荷指纹(sha256)", max_length=64)
+    received_at = models.DateTimeField("接收时间", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "接收账本"
+        verbose_name_plural = verbose_name
+        constraints = [
+            models.UniqueConstraint(fields=["device_id", "operation_no"], name="uniq_ingest_op_no"),
+            models.UniqueConstraint(fields=["device_id", "seq"], name="uniq_ingest_op_seq"),
+        ]
+        indexes = [models.Index(fields=["device_id", "seq"])]
+        ordering = ["device_id", "seq"]
+
+    def save(self, *args, **kwargs):
+        from assessment.exceptions import ImmutableLedger
+
+        if not self._state.adding:
+            raise ImmutableLedger()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.device_id}#{self.seq} {self.operation_no} {self.op_type}"
+
+
+class IngestReceipt(models.Model):
+    """
+    逐条回执（可演进）：账本操作的处理状态与业务结果。
+    * pending   —— 已落账，等待前序补齐/媒体上传/轮到它执行；
+    * processed —— 已按序执行，result 记录事件号/处罚单号/照片id等；
+    * rejected  —— 领域规则拒绝（如重复整改、发生时无合同），终态不阻塞后续，可修复数据后重试；
+    * failed    —— 未预期错误，阻塞该设备后续操作，可人工重试。
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "待处理"
+        PROCESSED = "processed", "已处理"
+        REJECTED = "rejected", "业务拒绝"
+        FAILED = "failed", "处理失败"
+
+    operation = models.OneToOneField(
+        IngestOperation, on_delete=models.CASCADE, related_name="receipt", verbose_name="账本操作",
+    )
+    status = models.CharField("处理状态", max_length=16, choices=Status.choices, default=Status.PENDING)
+    result = models.JSONField("业务结果", null=True, blank=True)
+    error_code = models.CharField("错误码", max_length=64, blank=True, default="")
+    error_detail = models.CharField("错误说明", max_length=512, blank=True, default="")
+    status_note = models.CharField("状态备注", max_length=256, blank=True, default="")
+    attempts = models.PositiveIntegerField("处理尝试次数", default=0)
+    processed_at = models.DateTimeField("处理完成时间", null=True, blank=True)
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        verbose_name = "接收回执"
+        verbose_name_plural = verbose_name
+        indexes = [models.Index(fields=["status"])]
+
+    def __str__(self):
+        return f"{self.operation_id} {self.status}"
+
+
+class IngestMedia(models.Model):
+    """
+    采集媒体暂存：照片二进制先按 media_id 幂等落盘（上传中断可安全重传）。
+    证据照片(EvidencePhoto)只在对应账本操作被执行时才在同一事务里物化，
+    因此中断重传不会留下半个事件/处罚/相似候选，也不会产生孤儿证据。
+    """
+
+    media_id = models.CharField("媒体号(设备分配，全局唯一)", max_length=64, unique=True)
+    device_id = models.CharField("上传设备", max_length=64, db_index=True)
+    image = models.ImageField("图片文件", upload_to="ingest/%Y/%m/%d")
+    phash = models.CharField("感知哈希(hex)", max_length=64, editable=False)
+    sha256 = models.CharField("内容指纹(sha256)", max_length=64, editable=False)
+    photo = models.ForeignKey(
+        EvidencePhoto, on_delete=models.SET_NULL, related_name="ingest_media",
+        null=True, blank=True, verbose_name="已物化证据照片",
+    )
+    created_at = models.DateTimeField("上传时间", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "采集媒体"
+        verbose_name_plural = verbose_name
+
+    def __str__(self):
+        return self.media_id

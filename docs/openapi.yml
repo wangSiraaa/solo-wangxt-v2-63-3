@@ -670,6 +670,282 @@ paths:
       responses:
         '204':
           description: No response body
+  /api/ingest/batches/:
+    post:
+      operationId: ingest_batches_create
+      description: |-
+        采集包批量接入：设备离线操作按 (操作号, 设备内序号, 业务发生时间, 照片引用) 落账。
+        同一操作重放返回原回执；缺失前序的操作保持待处理，补齐后按序号顺序执行。
+      tags:
+      - ingest
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestBatchRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/IngestBatchRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/IngestBatchRequest'
+        required: true
+      security:
+      - cookieAuth: []
+      - basicAuth: []
+      - {}
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestBatchResponse'
+          description: ''
+  /api/ingest/devices/:
+    get:
+      operationId: ingest_devices_list
+      description: 设备水位：已连续接收/连续处理序号与各状态计数。
+      parameters:
+      - name: page
+        required: false
+        in: query
+        description: 分页结果集中的页码。
+        schema:
+          type: integer
+      tags:
+      - ingest
+      security:
+      - cookieAuth: []
+      - basicAuth: []
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedDeviceWatermarkList'
+          description: ''
+  /api/ingest/devices/{device_id}/:
+    get:
+      operationId: ingest_devices_retrieve
+      description: 设备水位：已连续接收/连续处理序号与各状态计数。
+      parameters:
+      - in: path
+        name: device_id
+        schema:
+          type: string
+          title: 设备编号
+        required: true
+      tags:
+      - ingest
+      security:
+      - cookieAuth: []
+      - basicAuth: []
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceWatermark'
+          description: ''
+  /api/ingest/media/:
+    get:
+      operationId: ingest_media_list
+      description: |-
+        采集媒体暂存：multipart 上传 `media_id` + `device_id` + `image`。
+        按 media_id 幂等——上传中断后重传相同内容返回原记录（reused=true）；
+        内容不一致返回 409。媒体落盘后会唤醒等待它的待处理操作。
+      parameters:
+      - in: query
+        name: device_id
+        schema:
+          type: string
+      - in: query
+        name: media_id
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: 分页结果集中的页码。
+        schema:
+          type: integer
+      tags:
+      - ingest
+      security:
+      - cookieAuth: []
+      - basicAuth: []
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedIngestMediaList'
+          description: ''
+    post:
+      operationId: ingest_media_create
+      description: |-
+        采集媒体暂存：multipart 上传 `media_id` + `device_id` + `image`。
+        按 media_id 幂等——上传中断后重传相同内容返回原记录（reused=true）；
+        内容不一致返回 409。媒体落盘后会唤醒等待它的待处理操作。
+      tags:
+      - ingest
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestMedia'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/IngestMedia'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/IngestMedia'
+        required: true
+      security:
+      - cookieAuth: []
+      - basicAuth: []
+      - {}
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestMedia'
+          description: ''
+  /api/ingest/media/{id}/:
+    get:
+      operationId: ingest_media_retrieve
+      description: |-
+        采集媒体暂存：multipart 上传 `media_id` + `device_id` + `image`。
+        按 media_id 幂等——上传中断后重传相同内容返回原记录（reused=true）；
+        内容不一致返回 409。媒体落盘后会唤醒等待它的待处理操作。
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        description: 标识此 采集媒体 的 唯一整数值。
+        required: true
+      tags:
+      - ingest
+      security:
+      - cookieAuth: []
+      - basicAuth: []
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestMedia'
+          description: ''
+  /api/ingest/operations/:
+    get:
+      operationId: ingest_operations_list
+      description: 接收账本与逐条回执的状态查询（只读）+ 单条重试动作。
+      parameters:
+      - in: query
+        name: device_id
+        schema:
+          type: string
+      - in: query
+        name: op_type
+        schema:
+          type: string
+          title: 操作类型
+          enum:
+          - rectify
+          - report
+        description: |-
+          * `report` - 问题上报（照片+立案资料）
+          * `rectify` - 整改回执
+      - name: page
+        required: false
+        in: query
+        description: 分页结果集中的页码。
+        schema:
+          type: integer
+      - in: query
+        name: receipt__status
+        schema:
+          type: string
+          title: 处理状态
+          enum:
+          - failed
+          - pending
+          - processed
+          - rejected
+        description: |-
+          * `pending` - 待处理
+          * `processed` - 已处理
+          * `rejected` - 业务拒绝
+          * `failed` - 处理失败
+      tags:
+      - ingest
+      security:
+      - cookieAuth: []
+      - basicAuth: []
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedIngestOperationReadList'
+          description: ''
+  /api/ingest/operations/{id}/:
+    get:
+      operationId: ingest_operations_retrieve
+      description: 接收账本与逐条回执的状态查询（只读）+ 单条重试动作。
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        description: 标识此 接收账本 的 唯一整数值。
+        required: true
+      tags:
+      - ingest
+      security:
+      - cookieAuth: []
+      - basicAuth: []
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestOperationRead'
+          description: ''
+  /api/ingest/operations/{id}/retry/:
+    post:
+      operationId: ingest_operations_retry_create
+      description: |-
+        人工重试：rejected/failed 重置为待处理后按序重派；pending 触发一次处理循环；
+        已 processed 返回 409（重放请走批量接入，不能重复执行）。
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        description: 标识此 接收账本 的 唯一整数值。
+        required: true
+      tags:
+      - ingest
+      security:
+      - cookieAuth: []
+      - basicAuth: []
+      - {}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestReceipt'
+          description: ''
   /api/penalties/:
     get:
       operationId: penalties_list
@@ -1247,6 +1523,36 @@ components:
       - id
       - valid_from
       - valid_to
+    DeviceWatermark:
+      type: object
+      properties:
+        device_id:
+          type: string
+          readOnly: true
+          title: 设备编号
+        received_through:
+          type: integer
+          readOnly: true
+          title: 已连续接收序号
+        processed_through:
+          type: integer
+          readOnly: true
+          title: 已连续处理序号
+        status_counts:
+          type: object
+          additionalProperties: {}
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+          title: 更新时间
+      required:
+      - device_id
+      - processed_through
+      - received_through
+      - status_counts
+      - updated_at
     DuplicateCandidate:
       type: object
       properties:
@@ -1489,6 +1795,240 @@ components:
       - lng
       - location
       - phash
+    IngestBatchRequest:
+      type: object
+      description: 批量接入请求：同一设备的一批操作（允许夹杂重放）。
+      properties:
+        device_id:
+          type: string
+          maxLength: 64
+        operations:
+          type: array
+          items:
+            $ref: '#/components/schemas/IngestOperationInput'
+      required:
+      - device_id
+      - operations
+    IngestBatchResponse:
+      type: object
+      properties:
+        device_id:
+          type: string
+        watermark:
+          $ref: '#/components/schemas/DeviceWatermark'
+        receipts:
+          type: array
+          items:
+            $ref: '#/components/schemas/IngestReceipt'
+      required:
+      - device_id
+      - receipts
+      - watermark
+    IngestMedia:
+      type: object
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        media_id:
+          type: string
+          title: 媒体号(设备分配，全局唯一)
+          maxLength: 64
+        device_id:
+          type: string
+          title: 上传设备
+          maxLength: 64
+        image:
+          type: string
+          format: uri
+          title: 图片文件
+        phash:
+          type: string
+          readOnly: true
+          title: 感知哈希(hex)
+        sha256:
+          type: string
+          readOnly: true
+          title: 内容指纹(sha256)
+        photo:
+          type: integer
+          readOnly: true
+          nullable: true
+          title: 已物化证据照片
+        reused:
+          type: boolean
+          readOnly: true
+          description: 本次上传是否为重传（内容一致，未重复落盘）
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+          title: 上传时间
+      required:
+      - created_at
+      - device_id
+      - id
+      - image
+      - media_id
+      - phash
+      - photo
+      - reused
+      - sha256
+    IngestOperationInput:
+      type: object
+      description: |-
+        单条设备操作。payload 按 op_type 约定：
+        * report  —— {lng, lat, photo_refs[], category?, description?, note?}
+        * rectify —— {event_no | report_operation_no, note?, photo_refs[]?, lng?, lat?}
+      properties:
+        operation_no:
+          type: string
+          description: 稳定操作号（设备内唯一，重放凭它幂等）
+          maxLength: 64
+        seq:
+          type: integer
+          minimum: 1
+          description: 设备内序号，从 1 开始连续递增
+        op_type:
+          $ref: '#/components/schemas/OpTypeEnum'
+        occurred_at:
+          type: string
+          format: date-time
+          description: 业务发生时间（归属/整改以它为准）
+        payload:
+          type: object
+          additionalProperties: {}
+      required:
+      - occurred_at
+      - op_type
+      - operation_no
+      - payload
+      - seq
+    IngestOperationRead:
+      type: object
+      description: 账本行 + 当前回执（状态查询）。
+      properties:
+        id:
+          type: integer
+          readOnly: true
+        device_id:
+          type: string
+          readOnly: true
+          title: 设备编号
+        operation_no:
+          type: string
+          readOnly: true
+          title: 稳定操作号
+        seq:
+          type: integer
+          readOnly: true
+          title: 设备内序号
+        op_type:
+          allOf:
+          - $ref: '#/components/schemas/OpTypeEnum'
+          readOnly: true
+          title: 操作类型
+        occurred_at:
+          type: string
+          format: date-time
+          readOnly: true
+          title: 业务发生时间
+          description: 合同归属/整改时间一律以它为准，而非到达时间
+        payload:
+          readOnly: true
+          title: 业务载荷
+        payload_hash:
+          type: string
+          readOnly: true
+          title: 载荷指纹(sha256)
+        received_at:
+          type: string
+          format: date-time
+          readOnly: true
+          title: 接收时间
+        receipt:
+          allOf:
+          - $ref: '#/components/schemas/IngestReceipt'
+          readOnly: true
+      required:
+      - device_id
+      - id
+      - occurred_at
+      - op_type
+      - operation_no
+      - payload
+      - payload_hash
+      - receipt
+      - received_at
+      - seq
+    IngestReceipt:
+      type: object
+      description: 逐条回执。
+      properties:
+        operation_id:
+          type: integer
+        operation_no:
+          type: string
+        seq:
+          type: integer
+        op_type:
+          type: string
+        status:
+          $ref: '#/components/schemas/IngestReceiptStatusEnum'
+        replayed:
+          type: boolean
+          description: 本次提交是否为重放（未重复执行）
+        result:
+          nullable: true
+        error_code:
+          type: string
+        error_detail:
+          type: string
+        status_note:
+          type: string
+        attempts:
+          type: integer
+        received_at:
+          type: string
+          format: date-time
+        processed_at:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+      - attempts
+      - error_code
+      - error_detail
+      - op_type
+      - operation_id
+      - operation_no
+      - processed_at
+      - received_at
+      - replayed
+      - result
+      - seq
+      - status
+      - status_note
+    IngestReceiptStatusEnum:
+      enum:
+      - pending
+      - processed
+      - rejected
+      - failed
+      type: string
+      description: |-
+        * `pending` - 待处理
+        * `processed` - 已处理
+        * `rejected` - 业务拒绝
+        * `failed` - 处理失败
+    OpTypeEnum:
+      enum:
+      - report
+      - rectify
+      type: string
+      description: |-
+        * `report` - 问题上报（照片+立案资料）
+        * `rectify` - 整改回执
     PaginatedCleaningContractList:
       type: object
       required:
@@ -1512,6 +2052,29 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/CleaningContract'
+    PaginatedDeviceWatermarkList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeviceWatermark'
     PaginatedDuplicateCandidateList:
       type: object
       required:
@@ -1581,6 +2144,52 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/EvidencePhoto'
+    PaginatedIngestMediaList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/IngestMedia'
+    PaginatedIngestOperationReadList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/IngestOperationRead'
     PaginatedPenaltyUnitList:
       type: object
       required:

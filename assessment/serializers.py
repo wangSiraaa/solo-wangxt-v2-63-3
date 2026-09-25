@@ -7,9 +7,13 @@ from drf_spectacular.utils import extend_schema_field
 
 from assessment.models import (
     CleaningContract,
+    DeviceWatermark,
     DuplicateCandidate,
     EscalationRecord,
     EvidencePhoto,
+    IngestMedia,
+    IngestOperation,
+    IngestReceipt,
     PenaltyUnit,
     PenaltyVersion,
     ProblemEvent,
@@ -220,3 +224,154 @@ class ProblemEventSerializer(serializers.ModelSerializer):
             "photos", "penalty", "rectification", "created_at",
         ]
         read_only_fields = fields
+
+
+# ---------------------------------------------------------------------------
+# 离线采集包接入
+# ---------------------------------------------------------------------------
+
+def _validate_photo_refs(value, *, required):
+    if value is None:
+        return "至少一个照片引用（媒体号字符串列表）" if required else None
+    if not isinstance(value, list) or (required and not value):
+        return "照片引用必须是非空媒体号字符串列表"
+    if not all(isinstance(item, str) and item for item in value):
+        return "照片引用必须是媒体号字符串列表"
+    return None
+
+
+def _validate_lng_lat(payload, *, required):
+    errors = {}
+    lng, lat = payload.get("lng"), payload.get("lat")
+    for name, value, bound in (("lng", lng, 180), ("lat", lat, 90)):
+        if value is None:
+            if required:
+                errors[name] = "必填"
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not -bound <= value <= bound:
+            errors[name] = f"必须在 [-{bound}, {bound}] 范围内"
+    if not required and (lng is None) != (lat is None):
+        errors["lng"] = "经纬度必须同时提供"
+    return errors
+
+
+class IngestOperationInputSerializer(serializers.Serializer):
+    """
+    单条设备操作。payload 按 op_type 约定：
+    * report  —— {lng, lat, photo_refs[], category?, description?, note?}
+    * rectify —— {event_no | report_operation_no, note?, photo_refs[]?, lng?, lat?}
+    """
+
+    operation_no = serializers.CharField(max_length=64, help_text="稳定操作号（设备内唯一，重放凭它幂等）")
+    seq = serializers.IntegerField(min_value=1, help_text="设备内序号，从 1 开始连续递增")
+    op_type = serializers.ChoiceField(choices=IngestOperation.OpType.choices)
+    occurred_at = serializers.DateTimeField(help_text="业务发生时间（归属/整改以它为准）")
+    payload = serializers.DictField()
+
+    def validate(self, attrs):
+        payload = attrs["payload"]
+        errors = {}
+        if attrs["op_type"] == IngestOperation.OpType.REPORT:
+            errors.update(_validate_lng_lat(payload, required=True))
+            refs_error = _validate_photo_refs(payload.get("photo_refs"), required=True)
+            if refs_error:
+                errors["photo_refs"] = refs_error
+            category = payload.get("category")
+            if category is not None and category not in ProblemEvent.Category.values:
+                errors["category"] = f"未知问题类别 {category}"
+        else:  # rectify
+            if not payload.get("event_no") and not payload.get("report_operation_no"):
+                errors["event_no"] = "整改回执必须引用 event_no 或 report_operation_no 之一"
+            refs_error = _validate_photo_refs(payload.get("photo_refs"), required=False)
+            if refs_error:
+                errors["photo_refs"] = refs_error
+            errors.update(_validate_lng_lat(payload, required=False))
+        if errors:
+            raise serializers.ValidationError({"payload": errors})
+        return attrs
+
+
+class IngestBatchRequestSerializer(serializers.Serializer):
+    """批量接入请求：同一设备的一批操作（允许夹杂重放）。"""
+
+    device_id = serializers.CharField(max_length=64)
+    operations = IngestOperationInputSerializer(many=True, max_length=200)
+
+
+class IngestReceiptSerializer(serializers.Serializer):
+    """逐条回执。"""
+
+    operation_id = serializers.IntegerField()
+    operation_no = serializers.CharField()
+    seq = serializers.IntegerField()
+    op_type = serializers.CharField()
+    status = serializers.ChoiceField(choices=IngestReceipt.Status.choices)
+    replayed = serializers.BooleanField(help_text="本次提交是否为重放（未重复执行）")
+    result = serializers.JSONField(allow_null=True)
+    error_code = serializers.CharField(allow_blank=True)
+    error_detail = serializers.CharField(allow_blank=True)
+    status_note = serializers.CharField(allow_blank=True)
+    attempts = serializers.IntegerField()
+    received_at = serializers.DateTimeField()
+    processed_at = serializers.DateTimeField(allow_null=True)
+
+
+class DeviceWatermarkSerializer(serializers.ModelSerializer):
+    status_counts = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DeviceWatermark
+        fields = ["device_id", "received_through", "processed_through", "status_counts", "updated_at"]
+        read_only_fields = fields
+
+    @extend_schema_field(serializers.DictField)
+    def get_status_counts(self, obj) -> dict:
+        counts = {key: 0 for key in IngestReceipt.Status.values}
+        for row in (
+            IngestReceipt.objects.filter(operation__device_id=obj.device_id)
+            .values("status")
+            .annotate(total=models.Count("id"))
+        ):
+            counts[row["status"]] = row["total"]
+        return counts
+
+
+class IngestBatchResponseSerializer(serializers.Serializer):
+    device_id = serializers.CharField()
+    watermark = DeviceWatermarkSerializer()
+    receipts = IngestReceiptSerializer(many=True)
+
+
+class IngestOperationReadSerializer(serializers.ModelSerializer):
+    """账本行 + 当前回执（状态查询）。"""
+
+    receipt = serializers.SerializerMethodField()
+
+    class Meta:
+        model = IngestOperation
+        fields = [
+            "id", "device_id", "operation_no", "seq", "op_type", "occurred_at",
+            "payload", "payload_hash", "received_at", "receipt",
+        ]
+        read_only_fields = fields
+
+    @extend_schema_field(IngestReceiptSerializer)
+    def get_receipt(self, obj) -> dict:
+        from assessment.services.ingest import receipt_to_dict
+
+        return receipt_to_dict(obj)
+
+
+class IngestMediaSerializer(serializers.ModelSerializer):
+    reused = serializers.SerializerMethodField(help_text="本次上传是否为重传（内容一致，未重复落盘）")
+
+    class Meta:
+        model = IngestMedia
+        fields = ["id", "media_id", "device_id", "image", "phash", "sha256", "photo", "reused", "created_at"]
+        read_only_fields = ["phash", "sha256", "photo", "created_at"]
+        # 幂等重传由服务层判定（相同内容返回原记录），不能让唯一性校验器提前 400
+        extra_kwargs = {"media_id": {"validators": []}}
+
+    @extend_schema_field(serializers.BooleanField)
+    def get_reused(self, obj) -> bool:
+        return bool(getattr(obj, "_reused", False))
